@@ -1,66 +1,144 @@
 """Temporary parsing / cleaning layer.
 
-This first version keeps parsing deliberately simple so it can be adapted after
-reviewing debug_extraction.txt from real statements.
+This version is tailored for the current bank statement structure while keeping
+the code easy to extend with additional banking keywords.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from hashlib import sha1
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-
+# Real statement line format (example):
+# 08.10 08.10 Virement Vir Inst vers gar foot 16,00
+#  ^op_date ^value_date                ^amount (always last token)
 LINE_PATTERN = re.compile(
-    r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<label>.+?)\s+(?P<amount>-?\d+[\.,]\d{2})$"
+    r"^(?P<op_date>\d{2}\.\d{2})\s+(?P<value_date>\d{2}\.\d{2})\s+(?P<label>.+?)\s+(?P<amount>\d+[\.,]\d{2})$"
 )
 
 
+@dataclass(frozen=True)
+class KeywordRule:
+    """Business rule attached to a banking keyword prefix.
+
+    Attributes:
+        prefix: Label prefix to match.
+        force_negative: If True, amount is always forced negative.
+        strip_prefix_for_tiers: If True, tiers is the remaining label after prefix.
+    """
+
+    prefix: str
+    force_negative: bool
+    strip_prefix_for_tiers: bool = True
+
+
+# Ordered from most specific to most generic to avoid ambiguous matches.
+KEYWORD_RULES: List[KeywordRule] = [
+    KeywordRule(prefix="Virement Vir Inst vers", force_negative=True),
+    KeywordRule(prefix="Virement Web", force_negative=True),
+    KeywordRule(prefix="Carte X1840", force_negative=True),
+    KeywordRule(prefix="Prlv", force_negative=True),
+    KeywordRule(prefix="Cotis", force_negative=True),
+    # "Virement" alone (or as start of label) is considered incoming money.
+    KeywordRule(prefix="Virement", force_negative=False),
+]
+
+
+def _parse_statement_date(op_date_str: str, now: datetime) -> date:
+    """Rebuild operation date using current year from system time."""
+    return datetime.strptime(f"{op_date_str}.{now.year}", "%d.%m.%Y").date()
+
+
+def _extract_tiers(label: str, rule: KeywordRule | None) -> str:
+    """Extract tiers from label using the matched keyword rule."""
+    if rule and rule.strip_prefix_for_tiers and label.startswith(rule.prefix):
+        remainder = label[len(rule.prefix) :].strip(" -")
+        if remainder:
+            return remainder
+
+    # Fallback: keep the full label if no rule matched or no remainder exists.
+    return label.strip() or "INCONNU"
+
+
+def _apply_amount_sign(amount: float, rule: KeywordRule | None) -> float:
+    """Apply business sign rule: specific prefixes are expenses (negative)."""
+    if rule and rule.force_negative:
+        return -abs(amount)
+    return abs(amount)
+
+
+def _match_keyword_rule(label: str) -> KeywordRule | None:
+    """Return the first matching keyword rule for the label, if any."""
+    for rule in KEYWORD_RULES:
+        if label.startswith(rule.prefix):
+            return rule
+    return None
+
+
 def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.DataFrame:
-    """Parse operations from extracted text.
+    """Parse operations from extracted PDF text.
 
-    Heuristic v1:
-    - Each operation on one line
-    - Starts with DD/MM/YYYY
-    - Ends with amount (e.g. 123,45 or -123,45)
-
-    Returns a DataFrame with final target columns.
+    Current strategy:
+    - Parse lines matching: DD.MM DD.MM <label> <amount>
+    - Ignore the second date (value date)
+    - Build operation date with current year
+    - Determine tiers and amount sign through configurable keyword rules
     """
     operations: List[Dict[str, Any]] = []
+    now = datetime.now()
 
     for page_idx, page_text in enumerate(pages_text, start=1):
-        for raw_line in page_text.splitlines():
+        logger.debug("Parsing page %s", page_idx)
+
+        for line_idx, raw_line in enumerate(page_text.splitlines(), start=1):
             line = raw_line.strip()
             if not line:
                 continue
 
             match = LINE_PATTERN.match(line)
             if not match:
+                logger.debug("[p%s:l%s] Ignored (pattern mismatch): %s", page_idx, line_idx, line)
                 continue
 
-            date_str = match.group("date")
+            op_date_str = match.group("op_date")
+            # Kept for debugging context even if ignored by business logic.
+            value_date_str = match.group("value_date")
             label = match.group("label").strip()
-            amount_str = match.group("amount").replace(".", "").replace(",", ".")
+            raw_amount = match.group("amount")
 
             try:
-                operation_date = datetime.strptime(date_str, "%d/%m/%Y").date()
-                amount = float(amount_str)
+                operation_date = _parse_statement_date(op_date_str, now)
+                normalized_amount = float(raw_amount.replace(".", "").replace(",", "."))
             except ValueError:
-                logger.debug("Skipped unparsable line: %s", line)
+                logger.debug("[p%s:l%s] Ignored (date/amount parse error): %s", page_idx, line_idx, line)
                 continue
 
-            # Temporary split: tier = first chunk before '-' if available.
-            tiers_guess = label.split("-")[0].strip()
-            tiers = tiers_guess if tiers_guess else "INCONNU"
+            matched_rule = _match_keyword_rule(label)
+            tiers = _extract_tiers(label, matched_rule)
+            signed_amount = _apply_amount_sign(normalized_amount, matched_rule)
 
-            operation_id_seed = f"{operation_date.isoformat()}|{label}|{amount:.2f}|{source_pdf.name}"
+            rule_name = matched_rule.prefix if matched_rule else "<none>"
+            logger.debug(
+                "[p%s:l%s] Parsed op_date=%s value_date=%s rule=%s tiers=%s amount=%s",
+                page_idx,
+                line_idx,
+                operation_date,
+                value_date_str,
+                rule_name,
+                tiers,
+                signed_amount,
+            )
+
+            operation_id_seed = f"{operation_date.isoformat()}|{label}|{signed_amount:.2f}|{source_pdf.name}"
             operation_id = sha1(operation_id_seed.encode("utf-8")).hexdigest()[:16]
 
             operations.append(
@@ -68,14 +146,12 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
                     "Date": operation_date,
                     "Tiers": tiers,
                     "Libellé brut": label,
-                    "Montant": amount,
+                    "Montant": signed_amount,
                     "Source PDF": source_pdf.name,
-                    "Date import": datetime.now().date(),
+                    "Date import": now.date(),
                     "ID opération": operation_id,
                 }
             )
-
-        logger.debug("Page %s parsed; current ops=%s", page_idx, len(operations))
 
     df = pd.DataFrame(
         operations,
@@ -90,5 +166,5 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
         ],
     )
 
-    logger.info("Parsed %s operations", len(df))
+    logger.info("Parsed %s operations from %s page(s)", len(df), len(pages_text))
     return df
