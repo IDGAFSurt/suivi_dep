@@ -21,9 +21,17 @@ logger = logging.getLogger(__name__)
 # Real statement line format (example):
 # 08.10 08.10 Virement Vir Inst vers gar foot 16,00
 #  ^op_date ^value_date                ^amount (always last token)
+#
+# Amount accepts optional thousands groups separated by spaces:
+# - 16,00
+# - 135,00
+# - 1 000,00
 LINE_PATTERN = re.compile(
-    r"^(?P<op_date>\d{2}\.\d{2})\s+(?P<value_date>\d{2}\.\d{2})\s+(?P<label>.+?)\s+(?P<amount>\d+[\.,]\d{2})$"
+    r"^(?P<op_date>\d{2}\.\d{2})\s+(?P<value_date>\d{2}\.\d{2})\s+(?P<label>.+?)\s+(?P<amount>\d{1,3}(?:\s\d{3})*[\.,]\d{2}|\d+[\.,]\d{2})$"
 )
+
+# Characters sometimes leaked by PDF text extraction and not part of content.
+TRAILING_NOISE_CHARS = "¨"
 
 
 @dataclass(frozen=True)
@@ -53,9 +61,33 @@ KEYWORD_RULES: List[KeywordRule] = [
 ]
 
 
+def _clean_raw_line(raw_line: str) -> str:
+    """Normalize an extracted line before applying parser regex.
+
+    - Removes trailing spaces.
+    - Removes known parasitic trailing characters (e.g. "¨").
+    - Trims again to avoid leftover spaces after cleanup.
+    """
+    cleaned = raw_line.rstrip()
+    cleaned = cleaned.rstrip(TRAILING_NOISE_CHARS).rstrip()
+    return cleaned
+
+
 def _parse_statement_date(op_date_str: str, now: datetime) -> date:
     """Rebuild operation date using current year from system time."""
     return datetime.strptime(f"{op_date_str}.{now.year}", "%d.%m.%Y").date()
+
+
+def _parse_amount(raw_amount: str) -> float:
+    """Convert amount text to Python float.
+
+    Handles thousands spaces and French decimal comma.
+    Examples:
+    - "16,00" -> 16.00
+    - "1 000,00" -> 1000.00
+    """
+    normalized = raw_amount.replace(" ", "").replace(".", "").replace(",", ".")
+    return float(normalized)
 
 
 def _extract_tiers(label: str, rule: KeywordRule | None) -> str:
@@ -88,6 +120,7 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
     """Parse operations from extracted PDF text.
 
     Current strategy:
+    - Clean extracted lines to remove known PDF parasitic trailing characters
     - Parse lines matching: DD.MM DD.MM <label> <amount>
     - Ignore the second date (value date)
     - Build operation date with current year
@@ -100,13 +133,20 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
         logger.debug("Parsing page %s", page_idx)
 
         for line_idx, raw_line in enumerate(page_text.splitlines(), start=1):
-            line = raw_line.strip()
+            line = _clean_raw_line(raw_line)
             if not line:
+                logger.debug("[p%s:l%s] Ignored (empty after cleanup)", page_idx, line_idx)
                 continue
 
             match = LINE_PATTERN.match(line)
             if not match:
-                logger.debug("[p%s:l%s] Ignored (pattern mismatch): %s", page_idx, line_idx, line)
+                logger.debug(
+                    "[p%s:l%s] Ignored (pattern mismatch) raw=%r cleaned=%r",
+                    page_idx,
+                    line_idx,
+                    raw_line,
+                    line,
+                )
                 continue
 
             op_date_str = match.group("op_date")
@@ -117,9 +157,15 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
 
             try:
                 operation_date = _parse_statement_date(op_date_str, now)
-                normalized_amount = float(raw_amount.replace(".", "").replace(",", "."))
-            except ValueError:
-                logger.debug("[p%s:l%s] Ignored (date/amount parse error): %s", page_idx, line_idx, line)
+                normalized_amount = _parse_amount(raw_amount)
+            except ValueError as exc:
+                logger.debug(
+                    "[p%s:l%s] Ignored (date/amount parse error: %s) cleaned=%r",
+                    page_idx,
+                    line_idx,
+                    exc,
+                    line,
+                )
                 continue
 
             matched_rule = _match_keyword_rule(label)
@@ -128,13 +174,14 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
 
             rule_name = matched_rule.prefix if matched_rule else "<none>"
             logger.debug(
-                "[p%s:l%s] Parsed op_date=%s value_date=%s rule=%s tiers=%s amount=%s",
+                "[p%s:l%s] Parsed op_date=%s value_date=%s rule=%s tiers=%s raw_amount=%s amount=%s",
                 page_idx,
                 line_idx,
                 operation_date,
                 value_date_str,
                 rule_name,
                 tiers,
+                raw_amount,
                 signed_amount,
             )
 
