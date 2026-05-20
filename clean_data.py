@@ -30,19 +30,18 @@ LINE_PATTERN = re.compile(
     r"^(?P<op_date>\d{2}\.\d{2})\s+(?P<value_date>\d{2}\.\d{2})\s+(?P<label>.+?)\s+(?P<amount>\d{1,3}(?:\s\d{3})*[\.,]\d{2}|\d+[\.,]\d{2})$"
 )
 
+# Extract statement date like DD-MM-YYYY from the PDF filename.
+FILENAME_DATE_PATTERN = re.compile(r"\b\d{2}-\d{2}-(?P<year>\d{4})\b")
+# Parasite date often added at the end of card labels (example: "... 11/10").
+TRAILING_LABEL_DATE_PATTERN = re.compile(r"\s+\d{2}/\d{2}$")
+
 # Characters sometimes leaked by PDF text extraction and not part of content.
 TRAILING_NOISE_CHARS = "¨"
 
 
 @dataclass(frozen=True)
 class KeywordRule:
-    """Business rule attached to a banking keyword prefix.
-
-    Attributes:
-        prefix: Label prefix to match.
-        force_negative: If True, amount is always forced negative.
-        strip_prefix_for_tiers: If True, tiers is the remaining label after prefix.
-    """
+    """Business rule attached to a banking keyword prefix."""
 
     prefix: str
     force_negative: bool
@@ -62,43 +61,56 @@ KEYWORD_RULES: List[KeywordRule] = [
 
 
 def _clean_raw_line(raw_line: str) -> str:
-    """Normalize an extracted line before applying parser regex.
-
-    - Removes trailing spaces.
-    - Removes known parasitic trailing characters (e.g. "¨").
-    - Trims again to avoid leftover spaces after cleanup.
-    """
+    """Normalize an extracted line before applying parser regex."""
     cleaned = raw_line.rstrip()
     cleaned = cleaned.rstrip(TRAILING_NOISE_CHARS).rstrip()
     return cleaned
 
 
-def _parse_statement_date(op_date_str: str, now: datetime) -> date:
-    """Rebuild operation date using current year from system time."""
-    return datetime.strptime(f"{op_date_str}.{now.year}", "%d.%m.%Y").date()
+def _resolve_operation_year(source_pdf: Path, now: datetime) -> int:
+    """Resolve year from filename date DD-MM-YYYY, fallback to current year."""
+    match = FILENAME_DATE_PATTERN.search(source_pdf.name)
+    if match:
+        year = int(match.group("year"))
+        logger.info("Year resolved from PDF filename: %s (file=%s)", year, source_pdf.name)
+        return year
+
+    fallback_year = now.year
+    logger.warning(
+        "No DD-MM-YYYY date found in PDF filename. Falling back to current year %s (file=%s)",
+        fallback_year,
+        source_pdf.name,
+    )
+    return fallback_year
+
+
+def _parse_statement_date(op_date_str: str, year: int) -> date:
+    """Rebuild operation date using resolved statement year."""
+    return datetime.strptime(f"{op_date_str}.{year}", "%d.%m.%Y").date()
 
 
 def _parse_amount(raw_amount: str) -> float:
-    """Convert amount text to Python float.
-
-    Handles thousands spaces and French decimal comma.
-    Examples:
-    - "16,00" -> 16.00
-    - "1 000,00" -> 1000.00
-    """
+    """Convert amount text to Python float."""
     normalized = raw_amount.replace(" ", "").replace(".", "").replace(",", ".")
     return float(normalized)
+
+
+def _remove_trailing_label_date(text: str) -> str:
+    """Remove parasite ending date token JJ/MM from label/tiers only."""
+    return TRAILING_LABEL_DATE_PATTERN.sub("", text).strip()
 
 
 def _extract_tiers(label: str, rule: KeywordRule | None) -> str:
     """Extract tiers from label using the matched keyword rule."""
     if rule and rule.strip_prefix_for_tiers and label.startswith(rule.prefix):
         remainder = label[len(rule.prefix) :].strip(" -")
-        if remainder:
-            return remainder
+        tiers = _remove_trailing_label_date(remainder)
+        if tiers:
+            return tiers
 
-    # Fallback: keep the full label if no rule matched or no remainder exists.
-    return label.strip() or "INCONNU"
+    # Fallback: keep the full label (also cleaned from trailing parasite date).
+    fallback = _remove_trailing_label_date(label.strip())
+    return fallback or "INCONNU"
 
 
 def _apply_amount_sign(amount: float, rule: KeywordRule | None) -> float:
@@ -117,17 +129,10 @@ def _match_keyword_rule(label: str) -> KeywordRule | None:
 
 
 def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.DataFrame:
-    """Parse operations from extracted PDF text.
-
-    Current strategy:
-    - Clean extracted lines to remove known PDF parasitic trailing characters
-    - Parse lines matching: DD.MM DD.MM <label> <amount>
-    - Ignore the second date (value date)
-    - Build operation date with current year
-    - Determine tiers and amount sign through configurable keyword rules
-    """
+    """Parse operations from extracted PDF text."""
     operations: List[Dict[str, Any]] = []
     now = datetime.now()
+    operation_year = _resolve_operation_year(source_pdf, now)
 
     for page_idx, page_text in enumerate(pages_text, start=1):
         logger.debug("Parsing page %s", page_idx)
@@ -150,13 +155,13 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
                 continue
 
             op_date_str = match.group("op_date")
-            # Kept for debugging context even if ignored by business logic.
             value_date_str = match.group("value_date")
-            label = match.group("label").strip()
+            raw_label = match.group("label").strip()
+            clean_label = _remove_trailing_label_date(raw_label)
             raw_amount = match.group("amount")
 
             try:
-                operation_date = _parse_statement_date(op_date_str, now)
+                operation_date = _parse_statement_date(op_date_str, operation_year)
                 normalized_amount = _parse_amount(raw_amount)
             except ValueError as exc:
                 logger.debug(
@@ -168,31 +173,34 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
                 )
                 continue
 
-            matched_rule = _match_keyword_rule(label)
-            tiers = _extract_tiers(label, matched_rule)
+            matched_rule = _match_keyword_rule(clean_label)
+            tiers = _extract_tiers(clean_label, matched_rule)
             signed_amount = _apply_amount_sign(normalized_amount, matched_rule)
 
             rule_name = matched_rule.prefix if matched_rule else "<none>"
             logger.debug(
-                "[p%s:l%s] Parsed op_date=%s value_date=%s rule=%s tiers=%s raw_amount=%s amount=%s",
+                "[p%s:l%s] Parsed op_date=%s value_date=%s year=%s rule=%s tiers=%s raw_label=%r label=%r raw_amount=%s amount=%s",
                 page_idx,
                 line_idx,
                 operation_date,
                 value_date_str,
+                operation_year,
                 rule_name,
                 tiers,
+                raw_label,
+                clean_label,
                 raw_amount,
                 signed_amount,
             )
 
-            operation_id_seed = f"{operation_date.isoformat()}|{label}|{signed_amount:.2f}|{source_pdf.name}"
+            operation_id_seed = f"{operation_date.isoformat()}|{clean_label}|{signed_amount:.2f}|{source_pdf.name}"
             operation_id = sha1(operation_id_seed.encode("utf-8")).hexdigest()[:16]
 
             operations.append(
                 {
                     "Date": operation_date,
                     "Tiers": tiers,
-                    "Libellé brut": label,
+                    "Libellé brut": clean_label,
                     "Montant": signed_amount,
                     "Source PDF": source_pdf.name,
                     "Date import": now.date(),
@@ -213,5 +221,10 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
         ],
     )
 
-    logger.info("Parsed %s operations from %s page(s)", len(df), len(pages_text))
+    logger.info(
+        "Parsed %s operations from %s page(s) using year %s",
+        len(df),
+        len(pages_text),
+        operation_year,
+    )
     return df
