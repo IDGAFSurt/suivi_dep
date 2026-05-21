@@ -9,7 +9,7 @@ from pathlib import Path
 import logging
 
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import Workbook, load_workbook
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,33 @@ TARGET_COLUMNS = [
     "Date import",
     "ID opération",
 ]
+
+
+def get_last_non_empty_row(ws) -> int:
+    """Return last row index containing at least one non-empty cell.
+
+    Why this helper exists:
+    - `ws.max_row` can stay high after users clear cells manually in Excel.
+    - We therefore scan rows from bottom to top and stop at the first row
+      containing at least one non-empty value.
+
+    Returns at least 1 to preserve header row semantics.
+    """
+    # Start from openpyxl worksheet max_row and search upwards.
+    for row_idx in range(ws.max_row, 0, -1):
+        row_values = ws.iter_rows(
+            min_row=row_idx,
+            max_row=row_idx,
+            min_col=1,
+            max_col=max(len(TARGET_COLUMNS), ws.max_column),
+            values_only=True,
+        )
+        values = next(row_values)
+
+        if any(value not in (None, "") for value in values):
+            return max(1, row_idx)
+
+    return 1
 
 
 def append_operations_to_excel(excel_path: Path, new_data: pd.DataFrame) -> int:
@@ -53,15 +80,22 @@ def append_operations_to_excel(excel_path: Path, new_data: pd.DataFrame) -> int:
         if row and len(row) >= 7 and row[6]:
             existing_ids.add(str(row[6]))
 
+    # Compute next insertion row based on real non-empty rows.
+    next_row = get_last_non_empty_row(ws) + 1
+
     appended = 0
     for _, operation in new_data.iterrows():
         operation_id = str(operation["ID opération"])
         if operation_id in existing_ids:
             continue
 
-        ws.append([operation[col] for col in TARGET_COLUMNS])
+        # Write row cell-by-cell to avoid ws.append() behavior with stale max_row.
+        for col_idx, column_name in enumerate(TARGET_COLUMNS, start=1):
+            ws.cell(row=next_row, column=col_idx, value=operation[column_name])
+
         existing_ids.add(operation_id)
         appended += 1
+        next_row += 1
 
     # Remove default 'Sheet' only if empty and not used.
     if "Sheet" in wb.sheetnames and wb["Sheet"].max_row == 1 and wb["Sheet"].max_column == 1:

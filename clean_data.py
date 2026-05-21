@@ -31,7 +31,7 @@ LINE_PATTERN = re.compile(
 )
 
 # Extract statement date like DD-MM-YYYY from the PDF filename.
-FILENAME_DATE_PATTERN = re.compile(r"\b\d{2}-\d{2}-(?P<year>\d{4})\b")
+FILENAME_DATE_PATTERN = re.compile(r"\d{2}-\d{2}-(?P<year>\d{4})")
 # Parasite date often added at the end of card labels (example: "... 11/10").
 TRAILING_LABEL_DATE_PATTERN = re.compile(r"\s+\d{2}/\d{2}$")
 
@@ -69,18 +69,33 @@ def _clean_raw_line(raw_line: str) -> str:
 
 def _resolve_operation_year(source_pdf: Path, now: datetime) -> int:
     """Resolve year from filename date DD-MM-YYYY, fallback to current year."""
+
+    print("DEBUG filename =", source_pdf.name)
+
     match = FILENAME_DATE_PATTERN.search(source_pdf.name)
+
+    print("DEBUG regex pattern =", FILENAME_DATE_PATTERN.pattern)
+    print("DEBUG match =", match)
+
     if match:
+        print("DEBUG extracted year =", match.group("year"))
+
         year = int(match.group("year"))
+
         logger.info("Year resolved from PDF filename: %s (file=%s)", year, source_pdf.name)
+
         return year
 
     fallback_year = now.year
+
+    print("DEBUG fallback triggered")
+
     logger.warning(
         "No DD-MM-YYYY date found in PDF filename. Falling back to current year %s (file=%s)",
         fallback_year,
         source_pdf.name,
     )
+
     return fallback_year
 
 
@@ -133,6 +148,9 @@ def parse_operations_from_pages(pages_text: List[str], source_pdf: Path) -> pd.D
     operations: List[Dict[str, Any]] = []
     now = datetime.now()
     operation_year = _resolve_operation_year(source_pdf, now)
+    print("DEBUG source_pdf =", source_pdf)
+    print("DEBUG source_pdf.name =", source_pdf.name)
+    print("DEBUG operation_year =", operation_year)
 
     for page_idx, page_text in enumerate(pages_text, start=1):
         logger.debug("Parsing page %s", page_idx)
